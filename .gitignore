@@ -17,6 +17,10 @@ GTAGS
 *~
 *.ast_raw
 *.depend_raw
+<<<<<<< HEAD
 *.swp
 *.patch
 *.gcov
+=======
+ready
+>>>>>>> 3575572843 (ignore ready)
