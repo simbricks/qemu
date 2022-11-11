@@ -191,7 +191,7 @@ static void simbricks_comm_m2h_process(
             /* nop */
             break;
         case SIMBRICKS_PROTO_MEM_M2H_MSG_READCOMP:
-        simbricks_comm_m2h_rcomp(simbricks, ts, msg->readcomp.req_id,
+            simbricks_comm_m2h_rcomp(simbricks, ts, msg->readcomp.req_id,
                     (void *) msg->readcomp.data);
             break;
         case SIMBRICKS_PROTO_MEM_M2H_MSG_WRITECOMP:
@@ -222,8 +222,8 @@ static void simbricks_timer_poll(void *data)
 #ifdef DEBUG_PRINTS
     uint64_t poll_ts = SimbricksMemIfM2HInTimestamp(&simbricks->memif);
     if (proto_ts > poll_ts + 1 || proto_ts < poll_ts)
-        warn_report("simbricks_timer_poll: expected_ts=%lu cur_ts=%lu",
-                    poll_ts, cur_ts);
+        warn_report("simbricks_timer_poll: expected_pts=%lu cur_pts=%lu",
+                    poll_ts, proto_ts);
     warn_report("simbricks_timer_poll: ts=%ld sync_ts=%ld", cur_ts,
                 timer_expire_time_ns(simbricks->timer_sync));
 #endif
@@ -327,8 +327,7 @@ static void *simbricks_poll_thread(void *opaque)
 /******************************************************************************/
 /* MMIO interface */
 
-/* submit a bar read or write to the worker thread and wait for it to
- * complete */
+/* submit a read or write to the worker thread and wait for it to complete */
 static void simbricks_mmio_rw(SimbricksMemState *simbricks,
                               hwaddr addr,
                               unsigned size,
@@ -404,7 +403,7 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks,
     } else {
         read = &msg->read;
 
-        read->req_id = req - simbricks->reqs;
+        read->req_id = cpu->cpu_index;
         read->addr = addr;
         read->len = size;
 
@@ -414,7 +413,6 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks,
         /* start processing request */
         req->processing = true;
         req->requested = true;
-        req->size = size;
 
         req->addr = addr;
         req->size = size;
@@ -457,7 +455,11 @@ static void simbricks_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 static const MemoryRegionOps simbricks_mmio_ops = {
     .read = simbricks_mmio_read,
     .write = simbricks_mmio_write,
-    .endianness = DEVICE_NATIVE_ENDIAN
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.max_access_size = 64,
+    .impl.max_access_size = 64,
+    .valid.unaligned = true,
+    .impl.unaligned = true
 };
 
 /******************************************************************************/
