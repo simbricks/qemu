@@ -45,6 +45,8 @@
 // clang-format on
 
 // #define DEBUG_PRINTS
+// #define DEBUG_PRINTS_VERBOSE
+bool verbose_debug_prints = false; /* skip verbose prints during startup */
 
 #define SIMBRICKS_CLOCK QEMU_CLOCK_VIRTUAL
 
@@ -71,7 +73,6 @@ typedef struct SimbricksMemState {
   char *socket_path; /* path to ux socket to connect to */
   uint64_t mem_latency;
   uint64_t sync_period;
-  // uint64_t staticASId;
   uint64_t base_address;
   uint64_t size;
 
@@ -111,7 +112,7 @@ static void panic(const char *msg, ...) {
 }
 
 static inline uint64_t ts_to_proto(SimbricksMemState *simbricks,
-                                   int64_t qemu_ts) {
+                                  int64_t qemu_ts) {
   return (qemu_ts - simbricks->ts_base) * 1000;
 }
 
@@ -157,8 +158,8 @@ static void simbricks_comm_m2h_rcomp(SimbricksMemState *simbricks,
     cpu = req->cpu;
 
 #ifdef DEBUG_PRINTS
-        warn_report("simbricks_comm_m2h_rcomp: kicking cpu %lu ts=%lu",
-                req_id, cur_ts);
+    warn_report("simbricks_comm_m2h_rcomp: kicking cpu %lu ts=%lu", req_id,
+                cur_ts);
 #endif
 
     cpu->stopped = 0;
@@ -174,9 +175,11 @@ static void simbricks_comm_m2h_process(
     volatile union SimbricksProtoMemM2H *msg) {
   uint8_t type;
 
-    type = SimbricksMemIfM2HInType(&simbricks->memif, msg);
-#ifdef DEBUG_PRINTS
+  type = SimbricksMemIfM2HInType(&simbricks->memif, msg);
+#ifdef DEBUG_PRINTS_VERBOSE
+  if (verbose_debug_prints) {
     warn_report("simbricks_comm_m2h_process: ts=%ld type=%u", ts, type);
+  }
 #endif
 
   switch (type) {
@@ -206,17 +209,21 @@ static void simbricks_timer_poll(void *data) {
   volatile union SimbricksProtoMemM2H *next_msg;
   int64_t cur_ts, next_ts, proto_ts;
 
-    cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
-    proto_ts = ts_to_proto(simbricks, cur_ts + 1); // + 1 to avoid getting stuck
-                                                   // on off by ones due to of
-                                                   // rounding
-#ifdef DEBUG_PRINTS
+  cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+  proto_ts = ts_to_proto(
+      simbricks,
+      cur_ts +
+          1); /* +1 to avoid getting stuck on off by ones due to rounding */
+#ifdef DEBUG_PRINTS_VERBOSE
+  if (verbose_debug_prints) {
     uint64_t poll_ts = SimbricksMemIfM2HInTimestamp(&simbricks->memif);
-    if (proto_ts > poll_ts + 1 || proto_ts < poll_ts)
+    if (proto_ts > poll_ts + 1 || proto_ts < poll_ts) {
       warn_report("simbricks_timer_poll: expected_pts=%lu cur_pts=%lu", poll_ts,
                   proto_ts);
+    }
     warn_report("simbricks_timer_poll: ts=%ld sync_ts=%ld", cur_ts,
                 timer_expire_time_ns(simbricks->timer_sync));
+  }
 #endif
 
   /* poll until we have a message (should not usually spin) */
@@ -247,13 +254,16 @@ static void simbricks_timer_poll(void *data) {
   /* now process the message */
   simbricks_comm_m2h_process(simbricks, cur_ts, msg);
 
-#ifdef DEBUG_PRINTS
+#ifdef DEBUG_PRINTS_VERBOSE
+  if (verbose_debug_prints) {
     int64_t now_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
-    if (cur_ts != now_ts)
+    if (cur_ts != now_ts) {
       warn_report("simbricks_timer_poll: time advanced from %lu to %lu", cur_ts,
                   now_ts);
+    }
 
     warn_report("simbricks_timer_poll: done, next=%ld", next_ts);
+  }
 #endif
 }
 
@@ -265,32 +275,40 @@ static void simbricks_timer_sync(void *data) {
   cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
   proto_ts = ts_to_proto(simbricks, cur_ts);
 
-#ifdef DEBUG_PRINTS
+#ifdef DEBUG_PRINTS_VERBOSE
+  if (verbose_debug_prints) {
     uint64_t sync_ts = SimbricksMemIfH2MOutNextSync(&simbricks->memif);
-    if (proto_ts > sync_ts + 1)
+    if (proto_ts > sync_ts + 1) {
       warn_report("simbricks_timer_sync: expected_ts=%lu cur_ts=%lu", sync_ts,
                   proto_ts);
+    }
 
     warn_report("simbricks_timer_sync: ts=%lu pts=%lu npts=%lu", cur_ts,
-            proto_ts, sync_ts);
+                proto_ts, sync_ts);
+  }
 #endif
 
   while (SimbricksMemIfH2MOutSync(&simbricks->memif, proto_ts))
     ;
 
-#ifdef DEBUG_PRINTS
+#ifdef DEBUG_PRINTS_VERBOSE
+  if (verbose_debug_prints) {
     int64_t now_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
-    if (cur_ts != now_ts)
-        warn_report("simbricks_timer_poll: time advanced from %lu to %lu",
-                    cur_ts, now_ts);
+    if (cur_ts != now_ts) {
+      warn_report("simbricks_timer_poll: time advanced from %lu to %lu", cur_ts,
+                  now_ts);
+    }
+  }
 #endif
-    uint64_t next_sync_pts = SimbricksMemIfH2MOutNextSync(&simbricks->memif);
-    uint64_t next_sync_ts = ts_from_proto(simbricks, next_sync_pts);
-#ifdef DEBUG_PRINTS
+  uint64_t next_sync_pts = SimbricksMemIfH2MOutNextSync(&simbricks->memif);
+  uint64_t next_sync_ts = ts_from_proto(simbricks, next_sync_pts);
+#ifdef DEBUG_PRINTS_VERBOSE
+  if (verbose_debug_prints) {
     warn_report("simbricks_timer_sync: next pts=%lu ts=%lu", next_sync_pts,
-        next_sync_ts);
+                next_sync_ts);
+  }
 #endif
-    timer_mod_ns(simbricks->timer_sync, next_sync_ts);
+  timer_mod_ns(simbricks->timer_sync, next_sync_ts);
 }
 
 static void *simbricks_poll_thread(void *opaque) {
@@ -331,36 +349,36 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
   req = simbricks->reqs + cpu->cpu_index;
   assert(req->cpu == cpu);
 
-    cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+  cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+
+#ifdef DEBUG_PRINTS
+  verbose_debug_prints = true;
+#endif
 
   if (req->requested) {
     /* a request from this CPU has been started */
     /* note that address might not match if an interrupt occurs, which in
      * turn triggers another read. */
-
-        if (req->processing) {
-            /* request in progress, we have to wait */
-            cpu->stopped = 1;
-            cpu_loop_exit(cpu);
-        } else if (req->addr == addr && req->size == size) {
-            /* request finished */
+    if (req->processing) {
+      /* request in progress, we have to wait */
+      cpu->stopped = 1;
+      cpu_loop_exit(cpu);
+    } else if (req->addr == addr && req->size == size) {
+/* request finished */
 #ifdef DEBUG_PRINTS
-            warn_report("simbricks_mmio_rw: done (%lu) a=%lx s=%x val=%lx",
-                        cur_ts, addr, size, req->value);
+      warn_report("simbricks_mmio_rw: done (%lu) addr=0x%lx size=%u val=0x%lx",
+                  cur_ts, addr, size, req->value);
 #endif
-            *val = req->value;
-            req->requested = false;
-            return;
-        } else {
-            /* request is done processing, but for a different address */
-            req->requested = false;
-        }
+      *val = req->value;
+      req->requested = false;
+      return;
+    } else {
+      /* request is done processing, but for a different address */
+      req->requested = false;
     }
+  }
 
   assert(!req->processing);
-
-  /* allocate host-to-device queue entry */
-  msg = simbricks_comm_h2m_alloc(simbricks, cur_ts);
 
   /* prepare operation */
   if (is_write) {
@@ -379,43 +397,47 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
                              SIMBRICKS_PROTO_MEM_H2M_MSG_WRITE);
 
 #ifdef DEBUG_PRINTS
-        warn_report("simbricks_mmio_rw: finished write (%lu) addr=%lx size=%x "
-                    "val=%lx", cur_ts, addr, size, *val);
+    warn_report(
+        "simbricks_mmio_rw: finished write (%lu) addr=0x%lx size=%u "
+        "val=0x%lx",
+        cur_ts, addr, size, *val);
 #endif
 
     /* we treat writes as posted and don't wait for completion */
     return;
   } else {
-    read = &msg->read;
+  read = &msg->read;
 
-    read->req_id = cpu->cpu_index;
-    read->addr = addr;
-    read->len = size;
+  read->req_id = cpu->cpu_index;
+  read->addr = addr;
+  read->len = size;
 
-    SimbricksMemIfH2MOutSend(&simbricks->memif, msg,
-                             SIMBRICKS_PROTO_MEM_H2M_MSG_READ);
+  SimbricksMemIfH2MOutSend(&simbricks->memif, msg,
+                           SIMBRICKS_PROTO_MEM_H2M_MSG_READ);
 
-    /* start processing request */
-    req->processing = true;
-    req->requested = true;
+  /* start processing request */
+  req->processing = true;
+  req->requested = true;
 
-    req->addr = addr;
-    req->size = size;
+  req->addr = addr;
+  req->size = size;
 
 #ifdef DEBUG_PRINTS
-        warn_report("simbricks_mmio_rw: starting wait for read (%lu) addr=%lx "
-                    "size=%x", cur_ts, addr, size);
+  warn_report(
+      "simbricks_mmio_rw: starting wait for read (%lu) addr=0x%lx "
+      "size=%u",
+      cur_ts, addr, size);
 #endif
 
-    if (simbricks->sync) {
-      cpu->stopped = 1;
-      cpu_loop_exit(cpu);
-    } else {
-      while (req->processing)
-        qemu_cond_wait_iothread(&req->cond);
+  if (simbricks->sync) {
+    cpu->stopped = 1;
+    cpu_loop_exit(cpu);
+  } else {
+    while (req->processing)
+      qemu_cond_wait_iothread(&req->cond);
 
-      *val = req->value;
-      req->requested = false;
+    *val = req->value;
+    req->requested = false;
     }
   }
 }
