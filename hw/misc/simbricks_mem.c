@@ -59,6 +59,13 @@ typedef struct SimbricksMemRequest {
   uint64_t addr;
   uint64_t value; /* value read/to be written */
   unsigned size;
+
+  /* store result of successful read request when resuming CPU with different
+  instruction */
+  uint64_t cached_addr;
+  uint64_t cached_value;
+  unsigned cached_size;
+
   bool processing;
   bool requested;
 } SimbricksMemRequest;
@@ -335,6 +342,8 @@ static void *simbricks_poll_thread(void *opaque) {
 /******************************************************************************/
 /* MMIO interface */
 
+static bool logging_active = false;
+
 /* submit a read or write to the worker thread and wait for it to complete */
 static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
                               unsigned size, uint64_t *val, bool is_write) {
@@ -373,8 +382,20 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
       req->requested = false;
       return;
     } else {
-      /* request is done processing, but for a different address */
+      /* Request is done processing, but for a different address. Cache the
+      result because the CPU is probably retrying an instruction that was split
+      into multiple ones.*/
       req->requested = false;
+      req->cached_addr = req->addr;
+      req->cached_size = req->size;
+      req->cached_value = req->value;
+#ifdef DEBUG_PRINTS
+      warn_report(
+          "simbricks_mmio_rw: caching (%lu) req_addr=0x%lx req_size=%u "
+          "cached_addr=0x%lx cached_size=%u cached_val=0x%lx",
+          cur_ts, addr, size, req->cached_addr, req->cached_size,
+          req->cached_value);
+#endif
     }
   }
 
@@ -382,6 +403,12 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
 
   /* prepare operation */
   if (is_write) {
+    /* clear cache */
+    req->cached_addr = 0;
+    req->cached_size = 0;
+
+    msg = simbricks_comm_h2m_alloc(
+        simbricks, cur_ts); /* allocate host-to-device queue entry */
     write = &msg->write;
 
     write->req_id = cpu->cpu_index;
@@ -405,7 +432,26 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
 
     /* we treat writes as posted and don't wait for completion */
     return;
-  } else {
+  }
+
+  /* handle read request */
+  if (req->cached_addr == addr && req->cached_size == size) {
+    /* request handled by cache */
+    *val = req->cached_value;
+    req->cached_addr = 0;
+    req->cached_size = 0;
+
+#ifdef DEBUG_PRINTS
+    warn_report(
+        "simbricks_mmio_rw: done from cache (%lu) addr=0x%lx size=%u "
+        "val=0x%lx",
+        cur_ts, addr, size, req->cached_value);
+#endif
+    return;
+  }
+
+  msg = simbricks_comm_h2m_alloc(
+      simbricks, cur_ts); /* allocate host-to-device queue entry */
   read = &msg->read;
 
   read->req_id = cpu->cpu_index;
@@ -438,7 +484,6 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
 
     *val = req->value;
     req->requested = false;
-    }
   }
 }
 
