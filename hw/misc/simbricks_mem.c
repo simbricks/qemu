@@ -377,8 +377,6 @@ static void *simbricks_poll_thread(void *opaque) {
 /******************************************************************************/
 /* MMIO interface */
 
-static bool logging_active = false;
-
 /* submit a read or write to the worker thread and wait for it to complete */
 static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
                               unsigned size, uint64_t *val, bool is_write) {
