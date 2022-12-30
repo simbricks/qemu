@@ -570,8 +570,8 @@ static const MemoryRegionOps simbricks_mmio_ops = {
     .read = simbricks_mmio_read,
     .write = simbricks_mmio_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid.max_access_size = 64,
-    .impl.max_access_size = 64,
+    .valid.max_access_size = 8,
+    .impl.max_access_size = 8,
     .valid.unaligned = true,
     .impl.unaligned = true,
 };
