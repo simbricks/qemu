@@ -42,6 +42,7 @@
 #include "sysemu/cpus.h"
 #include "hw/core/cpu.h"
 #include "hw/boards.h"
+#include "qemu/fifo8.h"
 // clang-format on
 
 // #define DEBUG_PRINTS
@@ -53,6 +54,14 @@ bool verbose_debug_prints = false; /* skip verbose prints during startup */
 #define SIMBRICKS_MEM(obj) \
   OBJECT_CHECK(SimbricksMemState, obj, TYPE_MEM_SIMBRICKS_DEVICE)
 
+static unsigned read_cache_size = 6;
+
+struct ReadCacheEntry {
+  hwaddr addr;
+  unsigned size;
+  uint64_t value;
+};
+
 typedef struct SimbricksMemRequest {
   CPUState *cpu; /* CPU associated with this request */
   QemuCond cond;
@@ -60,14 +69,10 @@ typedef struct SimbricksMemRequest {
   uint64_t value; /* value read/to be written */
   unsigned size;
 
-  /* store result of successful read request when resuming CPU with different
-  instruction */
-  uint64_t cached_addr;
-  uint64_t cached_value;
-  unsigned cached_size;
-
   bool processing;
   bool requested;
+
+  Fifo8 read_cache;
 } SimbricksMemRequest;
 
 typedef struct SimbricksMemState {
@@ -118,6 +123,23 @@ static void panic(const char *msg, ...) {
   abort();
 }
 
+/* Get entry in read cache that corresponds to an address. Null if doesn't
+ * exist. */
+static inline struct ReadCacheEntry *read_cache_get_entry(Fifo8 *read_cache,
+                                                          uint64_t addr,
+                                                          unsigned size) {
+  for (uint32_t i = 0; i < read_cache->num;
+       i += sizeof(struct ReadCacheEntry)) {
+    struct ReadCacheEntry *entry =
+        (struct ReadCacheEntry *)(read_cache->data + (read_cache->head + i) %
+                                                         read_cache->capacity);
+    if (entry->addr == addr && entry->size == size) {
+      return entry;
+    }
+  }
+  return NULL;
+}
+
 static inline uint64_t ts_to_proto(SimbricksMemState *simbricks,
                                   int64_t qemu_ts) {
   return (qemu_ts - simbricks->ts_base) * 1000;
@@ -158,6 +180,19 @@ static void simbricks_comm_m2h_rcomp(SimbricksMemState *simbricks,
   /* copy read value from message */
   req->value = 0;
   memcpy(&req->value, data, req->size);
+
+  /* Add entry to read cache. We can be sure that no entry already exists or
+   * the request would have been served from the cache. */
+  if (fifo8_num_free(&req->read_cache) < sizeof(struct ReadCacheEntry)) {
+    uint32_t bytes_popped;
+    fifo8_pop_buf(&req->read_cache, sizeof(struct ReadCacheEntry),
+                  &bytes_popped);
+    assert(bytes_popped == sizeof(struct ReadCacheEntry));
+  }
+  struct ReadCacheEntry new_entry = {
+      .addr = req->addr, .size = req->size, .value = req->value};
+  fifo8_push_all(&req->read_cache, (uint8_t *)&new_entry,
+                 sizeof(struct ReadCacheEntry));
 
   req->processing = false;
 
@@ -371,31 +406,20 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
     if (req->processing) {
       /* request in progress, we have to wait */
       cpu->stopped = 1;
+      cpu->exception_index = 0x10000;
       cpu_loop_exit(cpu);
     } else if (req->addr == addr && req->size == size) {
 /* request finished */
+      *val = req->value;
+      req->requested = false;
 #ifdef DEBUG_PRINTS
       warn_report("simbricks_mmio_rw: done (%lu) addr=0x%lx size=%u val=0x%lx",
                   cur_ts, addr, size, req->value);
 #endif
-      *val = req->value;
-      req->requested = false;
       return;
     } else {
-      /* Request is done processing, but for a different address. Cache the
-      result because the CPU is probably retrying an instruction that was split
-      into multiple ones.*/
+      /* Request is done processing, but for a different address.*/
       req->requested = false;
-      req->cached_addr = req->addr;
-      req->cached_size = req->size;
-      req->cached_value = req->value;
-#ifdef DEBUG_PRINTS
-      warn_report(
-          "simbricks_mmio_rw: caching (%lu) req_addr=0x%lx req_size=%u "
-          "cached_addr=0x%lx cached_size=%u cached_val=0x%lx",
-          cur_ts, addr, size, req->cached_addr, req->cached_size,
-          req->cached_value);
-#endif
     }
   }
 
@@ -403,9 +427,8 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
 
   /* prepare operation */
   if (is_write) {
-    /* clear cache */
-    req->cached_addr = 0;
-    req->cached_size = 0;
+    /* clear read cache */
+    fifo8_reset(&req->read_cache);
 
     msg = simbricks_comm_h2m_alloc(
         simbricks, cur_ts); /* allocate host-to-device queue entry */
@@ -434,18 +457,25 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
     return;
   }
 
-  /* handle read request */
-  if (req->cached_addr == addr && req->cached_size == size) {
+  /* Handle read request. First check whether we can already find the result in
+   * the cache. This is necessary to make progress when handling faults in the
+   * TLB, which cause multiple read operations to be replayed when we stop the
+   * CPU.*/
+  if (cur_ts >= 738139280) {
+    __asm__ volatile("" : "+g"(addr) : :);
+  }
+
+  struct ReadCacheEntry *cached_entry =
+      read_cache_get_entry(&req->read_cache, addr, size);
+  if (cached_entry) {
     /* request handled by cache */
-    *val = req->cached_value;
-    req->cached_addr = 0;
-    req->cached_size = 0;
+    *val = cached_entry->value;
 
 #ifdef DEBUG_PRINTS
     warn_report(
         "simbricks_mmio_rw: done from cache (%lu) addr=0x%lx size=%u "
         "val=0x%lx",
-        cur_ts, addr, size, req->cached_value);
+        cur_ts, addr, size, cached_entry->value);
 #endif
     return;
   }
@@ -477,6 +507,7 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
 
   if (simbricks->sync) {
     cpu->stopped = 1;
+    cpu->exception_index = 0x10000;
     cpu_loop_exit(cpu);
   } else {
     while (req->processing)
@@ -599,9 +630,16 @@ static int simbricks_connect(SimbricksMemState *simbricks, Error **errp) {
     simbricks->reqs_len++;
   }
   simbricks->reqs = calloc(simbricks->reqs_len, sizeof(*simbricks->reqs));
+  if (simbricks->reqs_len > 1) {
+    panic(
+        "simbricks_mem: The read cache does not track the memory operations of "
+        "other CPUs, which means read operations could yield wrong results");
+  }
   CPU_FOREACH(cpu) {
     simbricks->reqs[cpu->cpu_index].cpu = cpu;
     qemu_cond_init(&simbricks->reqs[cpu->cpu_index].cond);
+    fifo8_create(&simbricks->reqs[cpu->cpu_index].read_cache,
+                 read_cache_size * sizeof(struct ReadCacheEntry));
   }
 
   if (simbricks->sync) {
