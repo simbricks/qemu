@@ -47,7 +47,10 @@
 
 // #define DEBUG_PRINTS
 // #define DEBUG_PRINTS_VERBOSE
+
+#ifdef DEBUG_PRINTS_VERBOSE
 bool verbose_debug_prints = false; /* skip verbose prints during startup */
+#endif
 
 #define SIMBRICKS_CLOCK QEMU_CLOCK_VIRTUAL
 
@@ -66,7 +69,7 @@ typedef struct SimbricksMemRequest {
   CPUState *cpu; /* CPU associated with this request */
   QemuCond cond;
   uint64_t addr;
-  uint64_t value; /* value read/to be written */
+  uint64_t value; /* read value */
   unsigned size;
 
   bool processing;
@@ -123,6 +126,20 @@ static void panic(const char *msg, ...) {
   abort();
 }
 
+/* Hack: Qemu doesn't allow stalling memory operations so instead we abort the
+ * CPU's current instruction. This works because the clock will keep
+ * advancing. */
+static inline void suspend_cpu(CPUState *cpu) {
+  cpu->stopped = 1;
+  cpu->exception_index = 0x10000; /* prevent Qemu from handling exceptions,
+                                     which will cause an infinite loop */
+  cpu_loop_exit(cpu);
+}
+
+static inline void resume_cpu(CPUState *cpu) {
+  cpu->stopped = 0;
+}
+
 /* Get entry in read cache that corresponds to an address. Null if doesn't
  * exist. */
 static inline struct ReadCacheEntry *read_cache_get_entry(Fifo8 *read_cache,
@@ -141,7 +158,7 @@ static inline struct ReadCacheEntry *read_cache_get_entry(Fifo8 *read_cache,
 }
 
 static inline uint64_t ts_to_proto(SimbricksMemState *simbricks,
-                                  int64_t qemu_ts) {
+                                   int64_t qemu_ts) {
   return (qemu_ts - simbricks->ts_base) * 1000;
 }
 
@@ -204,8 +221,7 @@ static void simbricks_comm_m2h_rcomp(SimbricksMemState *simbricks,
                 cur_ts);
 #endif
 
-    cpu->stopped = 0;
-    // qemu_cpu_kick(cpu);
+    resume_cpu(cpu);
   } else {
     qemu_cond_broadcast(&req->cond);
   }
@@ -236,7 +252,7 @@ static void simbricks_comm_m2h_process(
       /* we treat writes as posted, so nothing we need to do here */
       break;
     default:
-      panic("simbricks_comm_poll_m2h: unhandled type");
+      panic("simbricks_comm_m2h_process: unhandled type");
   }
 
   SimbricksMemIfM2HInDone(&simbricks->memif, msg);
@@ -393,7 +409,7 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
 
   cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
 
-#ifdef DEBUG_PRINTS
+#ifdef DEBUG_PRINTS_VERBOSE
   verbose_debug_prints = true;
 #endif
 
@@ -403,30 +419,33 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
      * turn triggers another read. */
     if (req->processing) {
       /* request in progress, we have to wait */
-      cpu->stopped = 1;
-      cpu->exception_index = 0x10000;
-      cpu_loop_exit(cpu);
+      suspend_cpu(cpu);
     } else if (req->addr == addr && req->size == size) {
-/* request finished */
+      /* request finished */
       *val = req->value;
       req->requested = false;
 #ifdef DEBUG_PRINTS
       warn_report("simbricks_mmio_rw: done (%lu) addr=0x%lx size=%u val=0x%lx",
-                  cur_ts, addr, size, req->value);
+                  cur_ts, addr, size, *val);
 #endif
       return;
     } else {
       /* Request is done processing, but for a different address.*/
       req->requested = false;
+#ifdef DEBUG_PRINTS
+      warn_report(
+          "simbricks_mmio_rw: done, but received different request (%lu) "
+          "addr=0x%lx size=%u is_write=%u",
+          cur_ts, addr, size, is_write);
+#endif
     }
   }
 
   assert(!req->processing);
 
-  /* prepare operation */
+  /* handle write request */
   if (is_write) {
-    /* clear read cache */
-    fifo8_reset(&req->read_cache);
+    fifo8_reset(&req->read_cache); /* clear read cache */
 
     msg = simbricks_comm_h2m_alloc(
         simbricks, cur_ts); /* allocate host-to-device queue entry */
@@ -459,10 +478,6 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
    * the cache. This is necessary to make progress when handling faults in the
    * TLB, which cause multiple read operations to be replayed when we stop the
    * CPU.*/
-  if (cur_ts >= 738139280) {
-    __asm__ volatile("" : "+g"(addr) : :);
-  }
-
   struct ReadCacheEntry *cached_entry =
       read_cache_get_entry(&req->read_cache, addr, size);
   if (cached_entry) {
@@ -471,7 +486,7 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
 
 #ifdef DEBUG_PRINTS
     warn_report(
-        "simbricks_mmio_rw: done from cache (%lu) addr=0x%lx size=%u "
+        "simbricks_mmio_rw: read done from cache (%lu) addr=0x%lx size=%u "
         "val=0x%lx",
         cur_ts, addr, size, cached_entry->value);
 #endif
@@ -503,10 +518,9 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
       cur_ts, addr, size);
 #endif
 
+  /* wait for result */
   if (simbricks->sync) {
-    cpu->stopped = 1;
-    cpu->exception_index = 0x10000;
-    cpu_loop_exit(cpu);
+    suspend_cpu(cpu);
   } else {
     while (req->processing)
       qemu_cond_wait_iothread(&req->cond);
