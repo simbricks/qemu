@@ -249,7 +249,10 @@ static void simbricks_comm_m2h_process(
                                (void *)msg->readcomp.data);
       break;
     case SIMBRICKS_PROTO_MEM_M2H_MSG_WRITECOMP:
-      /* we treat writes as posted, so nothing we need to do here */
+      panic(
+          "simbricks_comm_m2h_process: writes are treated as posted, so there "
+          "shouldn't be a write completion message.");
+
       break;
     default:
       panic("simbricks_comm_m2h_process: unhandled type");
@@ -461,7 +464,7 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
     memcpy((void *)write->data, val, size);
 
     SimbricksMemIfH2MOutSend(&simbricks->memif, msg,
-                             SIMBRICKS_PROTO_MEM_H2M_MSG_WRITE);
+                             SIMBRICKS_PROTO_MEM_H2M_MSG_WRITE_POSTED);
 
 #ifdef DEBUG_PRINTS
     warn_report(
@@ -469,8 +472,6 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
         "val=0x%lx",
         cur_ts, addr, size, *val);
 #endif
-
-    /* we treat writes as posted and don't wait for completion */
     return;
   }
 
