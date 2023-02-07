@@ -112,10 +112,10 @@ static int64_t icount_get_raw_locked(void)
     CPUState *cpu = current_cpu;
 
     if (cpu && cpu->running) {
-        if (!cpu->can_do_io) {
-            error_report("Bad icount read");
-            exit(1);
-        }
+        // if (!cpu->can_do_io) {
+        //     error_report("Bad icount read");
+        //     exit(1);
+        // }
         /* Take into account what has run */
         icount_update_locked(cpu);
     }

@@ -41,6 +41,11 @@ config SIMBRICKS_PCI
     default y if LIBSIMBRICKS
     depends on PCI && MSI_NONBROKEN && LIBSIMBRICKS
 
+config SIMBRICKS_MEM
+    bool
+    default y if LIBSIMBRICKS
+    depends on LIBSIMBRICKS
+
 config PCA9552
     bool
     depends on I2C

@@ -451,6 +451,7 @@ ninja=""
 skip_meson=no
 gettext=""
 simbricks_pci="no"
+simbricks_mem="no"
 
 bogus_os="no"
 malloc_trim="auto"
@@ -1521,6 +1522,10 @@ for opt do
   ;;
   --enable-simbricks-pci) simbricks_pci="yes"
   ;;
+  --disable-simbricks-mem) simbricks_mem="no"
+  ;;
+  --enable-simbricks-mem) simbricks_mem="yes"
+  ;;
   --gdb=*) gdb_bin="$optarg"
   ;;
   --enable-rng-none) rng_none=yes
@@ -1861,6 +1866,7 @@ disabled with --disable-FEATURE, default is enabled if available:
   rng-none        dummy RNG, avoid using /dev/(u)random and getrandom()
   libdaxctl       libdaxctl support
   simbricks-pci   Simbricks PCIe device adapter support
+  simbricks-mem   Simbricks memory adapter support
 
 NOTE: The object files are built at the place where configure is launched
 EOF
@@ -6732,6 +6738,9 @@ if test "$have_mlockall" = "yes" ; then
 fi
 if test "$simbricks_pci" = "yes" ; then
   echo "CONFIG_SIMBRICKS_PCI=y" >> $config_host_mak
+fi
+if test "$simbricks_mem" = "yes" ; then
+  echo "CONFIG_SIMBRICKS_MEM=y" >> $config_host_mak
 fi
 if test "$fuzzing" = "yes" ; then
   # If LIB_FUZZING_ENGINE is set, assume we are running on OSS-Fuzz, and the
