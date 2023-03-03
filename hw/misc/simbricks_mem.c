@@ -42,10 +42,9 @@
 #include "sysemu/cpus.h"
 #include "hw/core/cpu.h"
 #include "hw/boards.h"
-#include "qemu/fifo8.h"
 // clang-format on
 
-// #define DEBUG_PRINTS
+#define DEBUG_PRINTS
 // #define DEBUG_PRINTS_VERBOSE
 
 #ifdef DEBUG_PRINTS_VERBOSE
@@ -57,25 +56,24 @@ bool verbose_debug_prints = false; /* skip verbose prints during startup */
 #define SIMBRICKS_MEM(obj) \
   OBJECT_CHECK(SimbricksMemState, obj, TYPE_MEM_SIMBRICKS_DEVICE)
 
-static unsigned read_cache_size = 6;
-
-struct ReadCacheEntry {
+struct SimbricksMemRequest;
+typedef struct CacheEntry {
   hwaddr addr;
-  unsigned size;
-  uint64_t value;
-};
+  struct SimbricksMemRequest *waiters;
+  uint64_t last_access;
+  bool valid;
+  bool requested;
+  uint16_t lock;
+  uint8_t data[];
+} CacheEntry;
 
 typedef struct SimbricksMemRequest {
   CPUState *cpu; /* CPU associated with this request */
   QemuCond cond;
-  uint64_t addr;
-  uint64_t value; /* read value */
-  unsigned size;
-
-  bool processing;
-  bool requested;
-
-  Fifo8 read_cache;
+  bool pending;
+  CacheEntry *ce;
+  int32_t old_exception_index;
+  struct SimbricksMemRequest *next_waiter;
 } SimbricksMemRequest;
 
 typedef struct SimbricksMemState {
@@ -90,6 +88,8 @@ typedef struct SimbricksMemState {
   uint64_t sync_period;
   uint64_t base_address;
   uint64_t size;
+  uint64_t cache_size;
+  uint64_t cache_line_size;
 
   MemoryRegion mr;
 
@@ -102,6 +102,7 @@ typedef struct SimbricksMemState {
    * (protected by thr_mutex). */
   size_t reqs_len;
   SimbricksMemRequest *reqs;
+  CacheEntry **cache;
 
   /* timers for synchronization etc. */
   bool sync;
@@ -129,32 +130,19 @@ static void panic(const char *msg, ...) {
 /* Hack: Qemu doesn't allow stalling memory operations so instead we abort the
  * CPU's current instruction. This works because the clock will keep
  * advancing. */
-static inline void suspend_cpu(CPUState *cpu) {
+static inline void suspend_cpu(SimbricksMemState *simbricks, CPUState *cpu) {
+  SimbricksMemRequest *our_mr = simbricks->reqs + cpu->cpu_index;
   cpu->stopped = 1;
+  our_mr->old_exception_index = cpu->exception_index;
   cpu->exception_index = 0x10000; /* prevent Qemu from handling exceptions,
                                      which will cause an infinite loop */
   cpu_loop_exit(cpu);
 }
 
-static inline void resume_cpu(CPUState *cpu) {
+static inline void resume_cpu(SimbricksMemState *simbricks, CPUState *cpu) {
+  SimbricksMemRequest *our_mr = simbricks->reqs + cpu->cpu_index;
   cpu->stopped = 0;
-}
-
-/* Get entry in read cache that corresponds to an address. Null if doesn't
- * exist. */
-static inline struct ReadCacheEntry *read_cache_get_entry(Fifo8 *read_cache,
-                                                          uint64_t addr,
-                                                          unsigned size) {
-  for (uint32_t i = 0; i < read_cache->num;
-       i += sizeof(struct ReadCacheEntry)) {
-    struct ReadCacheEntry *entry =
-        (struct ReadCacheEntry *)(read_cache->data + (read_cache->head + i) %
-                                                         read_cache->capacity);
-    if (entry->addr == addr && entry->size == size) {
-      return entry;
-    }
-  }
-  return NULL;
+  cpu->exception_index = our_mr->old_exception_index;
 }
 
 static inline uint64_t ts_to_proto(SimbricksMemState *simbricks,
@@ -186,44 +174,49 @@ static void simbricks_comm_m2h_rcomp(SimbricksMemState *simbricks,
                                      uint64_t cur_ts, uint64_t req_id,
                                      const void *data) {
   SimbricksMemRequest *req = simbricks->reqs + req_id;
+  SimbricksMemRequest *mr, *next_mr;
+  CacheEntry *ce;
   CPUState *cpu;
 
   assert(req_id <= simbricks->reqs_len);
 
-  if (!req->processing) {
+  if (!req->pending) {
     panic("simbricks_comm_m2h_rcomp: no request currently processing");
   }
 
-  /* copy read value from message */
-  req->value = 0;
-  memcpy(&req->value, data, req->size);
-
-  /* Add entry to read cache. We can be sure that no entry already exists or
-   * the request would have been served from the cache. */
-  if (fifo8_num_free(&req->read_cache) < sizeof(struct ReadCacheEntry)) {
-    uint32_t bytes_popped;
-    fifo8_pop_buf(&req->read_cache, sizeof(struct ReadCacheEntry),
-                  &bytes_popped);
-    assert(bytes_popped == sizeof(struct ReadCacheEntry));
-  }
-  struct ReadCacheEntry new_entry = {
-      .addr = req->addr, .size = req->size, .value = req->value};
-  fifo8_push_all(&req->read_cache, (uint8_t *)&new_entry,
-                 sizeof(struct ReadCacheEntry));
-
-  req->processing = false;
-
-  if (simbricks->sync) {
-    cpu = req->cpu;
+  assert(req->ce != NULL);
+  ce = req->ce;
+  assert(!ce->valid);
+  assert(ce->requested);
 
 #ifdef DEBUG_PRINTS
-    warn_report("simbricks_comm_m2h_rcomp: kicking cpu %lu ts=%lu", req_id,
-                cur_ts);
+  warn_report("simbricks-mem: simbricks_comm_m2h_rcomp (%lu) %p completed",
+              cur_ts, ce);
 #endif
+  /* copy read value from message */
+  memcpy(&ce->data, data, simbricks->cache_line_size);
+  ce->requested = false;
+  ce->valid = true;
+  mr = ce->waiters;
+  ce->waiters = NULL;
 
-    resume_cpu(cpu);
-  } else {
-    qemu_cond_broadcast(&req->cond);
+  for (; mr != NULL; mr = next_mr) {
+    next_mr = mr->next_waiter;
+    mr->next_waiter = NULL;
+    mr->pending = false;
+
+    if (simbricks->sync) {
+      cpu = mr->cpu;
+
+  #ifdef DEBUG_PRINTS
+      warn_report("simbricks_comm_m2h_rcomp: kicking cpu %lu ts=%lu", req_id,
+                  cur_ts);
+  #endif
+
+      resume_cpu(simbricks, cpu);
+    } else {
+      qemu_cond_broadcast(&mr->cond);
+    }
   }
 }
 
@@ -394,8 +387,207 @@ static void *simbricks_poll_thread(void *opaque) {
 }
 
 /******************************************************************************/
+/* Cache management */
+
+static CacheEntry *cache_entry_get(SimbricksMemState *simbricks, hwaddr addr,
+                                   bool alloc, uint64_t ts)
+{
+  hwaddr cl_num = addr / simbricks->cache_line_size;
+  uint64_t key = cl_num;
+  uint64_t i;
+  CacheEntry *ce, *min_ce = NULL;
+
+  addr &= ~((uint64_t) simbricks->cache_line_size - 1);
+
+  // very simple hash mixer
+  key ^= key >> 33;
+  key *= 0xff51afd7ed558ccd;
+  key ^= key >> 33;
+  key *= 0xc4ceb9fe1a85ec53;
+  key ^= key >> 33;
+
+  for (i = 0; i < 8; i++) {
+    ce = simbricks->cache[(key + i) % simbricks->cache_size];
+    if (ce->addr == addr) {
+#ifdef DEBUG_PRINTS
+      warn_report("simbricks-mem: cache_entry_get (%lu) addr=0x%lx found %p l=%u",
+              ts, addr, ce, ce->lock);
+#endif
+      ce->last_access = ts;
+      ce->lock++;
+      return ce;
+    }
+
+    if (!ce->waiters && !ce->lock) {
+      if (min_ce == NULL || ce->last_access < min_ce->last_access)
+        min_ce = ce;
+    }
+  }
+
+  if (!alloc) {
+#ifdef DEBUG_PRINTS
+    warn_report("simbricks-mem: cache_entry_get (%lu) addr=0x%lx not found",
+            ts, addr);
+#endif
+    return NULL;
+  }
+
+  if (!min_ce) {
+    for (i = 0; i < 8; i++) {
+      ce = simbricks->cache[(key + i) % simbricks->cache_size];
+      warn_report("simbricks-mem: cache_entry_get (%lu) ci[%lu]=%p w=%p l=%u a=%lx",
+            ts, i, ce, ce->waiters, ce->lock, ce->addr);
+    }
+    panic("found no cache entries to allocate");
+  }
+
+#ifdef DEBUG_PRINTS
+  warn_report("simbricks-mem: cache_entry_get (%lu) addr=0x%lx allocated %p",
+          ts, addr, min_ce);
+#endif
+  min_ce->last_access = ts;
+  min_ce->valid = false;
+  min_ce->requested = false;
+  min_ce->addr = addr;
+  min_ce->lock++;
+  return min_ce;
+}
+
+static void cache_entry_release(SimbricksMemState *simbricks,
+                                CacheEntry *ce, uint64_t cur_ts)
+{
+#ifdef DEBUG_PRINTS
+  warn_report("simbricks-mem: cache_entry_release (%lu) %p l=%u",
+              cur_ts, ce, ce->lock);
+#endif
+  ce->lock--;
+}
+
+static int cache_entry_ensure_valid(SimbricksMemState *simbricks,
+                                    CacheEntry *ce,
+                                    uint64_t cur_ts)
+{
+  CPUState *cpu = current_cpu;
+  SimbricksMemRequest *our_mr, *mr;
+
+  if (ce->valid)
+    return 0;
+
+  assert(simbricks->reqs_len > cpu->cpu_index);
+  our_mr = simbricks->reqs + cpu->cpu_index;
+  assert(our_mr->cpu == cpu);
+
+  /* mem request slot for this CPU is busy */
+  if (our_mr->pending) {
+#ifdef DEBUG_PRINTS
+    warn_report("simbricks-mem: cache_entry_ensure_valid (%lu) %p CPU pending",
+                cur_ts, ce);
+#endif
+    return 1;
+  }
+
+  our_mr->pending = true;
+  our_mr->ce = ce;
+
+  if (!ce->requested) {
+    /* need to issue a request for this cache line */
+#ifdef DEBUG_PRINTS
+    warn_report("simbricks-mem: cache_entry_ensure_valid (%lu) %p issuing req l=%u",
+                cur_ts, ce, ce->lock);
+#endif
+    volatile union SimbricksProtoMemH2M *msg;
+    volatile struct SimbricksProtoMemH2MRead *read;
+
+    msg = simbricks_comm_h2m_alloc(
+        simbricks, cur_ts); /* allocate host-to-device queue entry */
+    read = &msg->read;
+
+    read->req_id = cpu->cpu_index;
+    read->addr = ce->addr;
+    read->len = simbricks->cache_line_size;
+
+    SimbricksMemIfH2MOutSend(&simbricks->memif, msg,
+                            SIMBRICKS_PROTO_MEM_H2M_MSG_READ);
+
+    ce->requested = true;
+
+    /* append mr to CE's waiters list (which is empty at this point) */
+    our_mr->ce = ce;
+    assert(ce->waiters == NULL);
+    our_mr->next_waiter = NULL;
+    ce->waiters = our_mr;
+  } else {
+    /* otherwise just add ourselves to waiting list */
+#ifdef DEBUG_PRINTS
+    warn_report("simbricks-mem: cache_entry_ensure_valid (%lu) %p waiting l=%u",
+                cur_ts, ce, ce->lock);
+#endif
+    assert(ce->waiters != NULL);
+    for (mr = ce->waiters; mr->next_waiter != NULL; mr = mr->next_waiter);
+    our_mr->next_waiter = NULL;
+    mr->next_waiter = our_mr;
+  }
+
+  /* wait for result */
+  if (simbricks->sync) {
+#ifdef DEBUG_PRINTS
+    warn_report("simbricks-mem: cache_entry_ensure_valid (%lu) %p suspending l=%u",
+                cur_ts, ce, ce->lock);
+#endif
+    cache_entry_release(simbricks, ce, cur_ts);
+    suspend_cpu(simbricks, cpu);
+    panic("suspend_cpu returned");
+    return 1;
+  } else {
+    /* in un-synchronized mode we just block until completion*/
+#ifdef DEBUG_PRINTS
+    warn_report("simbricks-mem: cache_entry_ensure_valid (%lu) %p blocking l=%u",
+                cur_ts, ce, ce->lock);
+#endif
+    while (!our_mr->pending)
+      qemu_cond_wait_iothread(&our_mr->cond);
+#ifdef DEBUG_PRINTS
+    warn_report("simbricks-mem: cache_entry_ensure_valid (%lu) %p ready (l=%u)",
+                cur_ts, ce, ce->lock);
+#endif
+    assert(ce->valid);
+    return 0;
+  }
+}
+
+
+static void issue_write(SimbricksMemState *simbricks, hwaddr addr, uint64_t val,
+                        unsigned size, uint64_t cur_ts)
+{
+  CPUState *cpu = current_cpu;
+  volatile union SimbricksProtoMemH2M *msg;
+  volatile struct SimbricksProtoMemH2MWrite *write;
+
+#ifdef DEBUG_PRINTS
+  warn_report("simbricks-mem: issue_write (%lu) addr=0x%lx size=%u val=0x%lx",
+              cur_ts, addr, size, val);
+#endif
+
+  msg = simbricks_comm_h2m_alloc(simbricks, cur_ts);
+  write = &msg->write;
+
+  write->req_id = cpu->cpu_index;
+  write->addr = addr;
+  write->len = size;
+
+  assert(size <=
+          SimbricksMemIfH2MOutMsgLen(&simbricks->memif) - sizeof(*write));
+  /* FIXME: this probably only works for LE */
+  memcpy((void *)write->data, &val, size);
+
+  SimbricksMemIfH2MOutSend(&simbricks->memif, msg,
+                            SIMBRICKS_PROTO_MEM_H2M_MSG_WRITE_POSTED);
+}
+
+/******************************************************************************/
 /* MMIO interface */
 
+#if 0
 /* submit a read or write to the worker thread and wait for it to complete */
 static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
                               unsigned size, uint64_t *val, bool is_write) {
@@ -530,20 +722,87 @@ static void simbricks_mmio_rw(SimbricksMemState *simbricks, hwaddr addr,
     req->requested = false;
   }
 }
+#endif
 
 static uint64_t simbricks_mmio_read(void *opaque, hwaddr addr, unsigned size) {
   SimbricksMemState *simbricks = SIMBRICKS_MEM(opaque);
+  CacheEntry *ce;
+  uint64_t cache_line_off;
   uint64_t ret = 0;
+  uint64_t cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
 
-  simbricks_mmio_rw(simbricks, addr, size, &ret, false);
+#ifdef DEBUG_PRINTS
+  warn_report("simbricks-mem: simbricks_mmio_read (%lu) addr=0x%lx size=%u",
+          cur_ts, addr, size);
+#endif
 
+  if (addr / simbricks->cache_line_size !=
+      (addr + size - 1) / simbricks->cache_line_size) {
+    panic("Do not support split-cache-line reads");
+  }
+
+  ce = cache_entry_get(simbricks, addr, true, cur_ts);
+  if (cache_entry_ensure_valid(simbricks, ce, cur_ts)) {
+    // not ready yet, CPU suspended
+#ifdef DEBUG_PRINTS
+    warn_report("simbricks-mem: simbricks_mmio_read (%lu) not ready",
+            cur_ts);
+#endif
+    cache_entry_release(simbricks, ce, cur_ts);
+    return 0;
+  }
+
+  cache_line_off = addr % simbricks->cache_line_size;
+  memcpy(&ret, ce->data + cache_line_off, size);
+  cache_entry_release(simbricks, ce, cur_ts);
+
+#ifdef DEBUG_PRINTS
+  warn_report("simbricks-mem: simbricks_mmio_read (%lu) finished ret=%lx",
+          cur_ts, ret);
+#endif
   return ret;
 }
 
 static void simbricks_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size) {
   SimbricksMemState *simbricks = SIMBRICKS_MEM(opaque);
-  simbricks_mmio_rw(simbricks, addr, size, &val, true);
+  CacheEntry *ce;
+  uint64_t cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+
+#ifdef DEBUG_PRINTS
+  warn_report("simbricks-mem: simbricks_mmio_write (%lu) addr=0x%lx size=%u "
+              "val=%lx", cur_ts, addr, size, val);
+#endif
+
+  if (addr / simbricks->cache_line_size !=
+      (addr + size - 1) / simbricks->cache_line_size) {
+    panic("Do not support split-cache-line writes");
+  }
+
+  // get cache entry, but do not allocate if none exists yet
+  ce = cache_entry_get(simbricks, addr, false, cur_ts);
+  if (ce) {
+    // if there is one, we need to make sure to wait for it to be valid
+    if (cache_entry_ensure_valid(simbricks, ce, cur_ts)) {
+      // not ready yet, CPU suspended
+      cache_entry_release(simbricks, ce, cur_ts);
+#ifdef DEBUG_PRINTS
+      warn_report("simbricks-mem: simbricks_mmio_write (%lu) suspend",
+                  cur_ts);
+#endif
+      return;
+    }
+
+    hwaddr cache_line_off = addr % simbricks->cache_line_size;
+    memcpy(ce->data + cache_line_off, &val, size);
+    cache_entry_release(simbricks, ce, cur_ts);
+  }
+
+  issue_write(simbricks, addr, val, size, cur_ts);
+#ifdef DEBUG_PRINTS
+  warn_report("simbricks-mem: simbricks_mmio_write (%lu) completed",
+              cur_ts);
+#endif
 }
 
 static const MemoryRegionOps simbricks_mmio_ops = {
@@ -638,6 +897,14 @@ static int simbricks_connect(SimbricksMemState *simbricks, Error **errp) {
       first_msg_ts = SimbricksMemIfM2HInTimestamp(&simbricks->memif);
     } while (!msg && !first_msg_ts);
   }
+
+  simbricks->cache = calloc(simbricks->cache_size, sizeof(*simbricks->cache));
+  uint64_t i;
+  for (i = 0; i < simbricks->cache_size; i++) {
+    simbricks->cache[i] = calloc(
+        1, sizeof(CacheEntry) + simbricks->cache_line_size);
+  }
+
   simbricks->reqs_len = 0;
   CPU_FOREACH(cpu) {
     simbricks->reqs_len++;
@@ -649,10 +916,9 @@ static int simbricks_connect(SimbricksMemState *simbricks, Error **errp) {
         "other CPUs, which means read operations could yield wrong results");
   }
   CPU_FOREACH(cpu) {
+    simbricks->reqs[cpu->cpu_index].pending = false;
     simbricks->reqs[cpu->cpu_index].cpu = cpu;
     qemu_cond_init(&simbricks->reqs[cpu->cpu_index].cond);
-    fifo8_create(&simbricks->reqs[cpu->cpu_index].read_cache,
-                 read_cache_size * sizeof(struct ReadCacheEntry));
   }
 
   if (simbricks->sync) {
@@ -701,6 +967,11 @@ static void mem_simbricks_unrealize(DeviceState *ds) {
     qemu_cond_destroy(&simbricks->reqs[cpu->cpu_index].cond);
   }
   free(simbricks->reqs);
+  uint64_t i;
+  for (i = 0; i < simbricks->cache_size; i++) {
+    free(simbricks->cache[i]);
+  }
+  free(simbricks->cache);
 
   if (simbricks->sync) {
     timer_del(simbricks->timer_dummy);
@@ -723,6 +994,9 @@ static Property simbricks_mem_dev_properties[] = {
     DEFINE_PROP_UINT64("sync-period", SimbricksMemState, sync_period, 500),
     DEFINE_PROP_UINT64("base-address", SimbricksMemState, base_address, 0),
     DEFINE_PROP_UINT64("size", SimbricksMemState, size, 0),
+    DEFINE_PROP_UINT64("cache-size", SimbricksMemState, cache_size, 1024),
+    DEFINE_PROP_UINT64("cache-line-size", SimbricksMemState, cache_line_size,
+                       64),
     DEFINE_PROP_END_OF_LIST(),
 };
 
