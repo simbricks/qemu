@@ -95,6 +95,9 @@ typedef struct SimbricksPciState {
     /* timers for synchronization etc. */
     bool sync;
     int sync_mode;
+    uint64_t sync_drift;
+    uint64_t sync_offset;
+    uint64_t next_out_ts;
     int64_t ts_base;
     QEMUTimer *timer_dummy;
     QEMUTimer *timer_sync;
@@ -122,15 +125,22 @@ static void panic(const char *msg, ...)
 }
 
 static inline uint64_t ts_to_proto(SimbricksPciState *simbricks,
-                                   int64_t qemu_ts)
+                                   int64_t qemu_ts,
+                                   bool round_up)
 {
-    return (qemu_ts - simbricks->ts_base) * 1000;
+    uint64_t ts = (qemu_ts - simbricks->ts_base) * simbricks->sync_drift;
+    if (round_up)
+      ts += simbricks->sync_drift - 1;
+    return ts;
 }
 
 static inline int64_t ts_from_proto(SimbricksPciState *simbricks,
-                                    uint64_t proto_ts)
+                                    uint64_t proto_ts,
+                                    bool round_up)
 {
-    return (proto_ts / 1000) + simbricks->ts_base;
+    if (round_up)
+        proto_ts += simbricks->sync_drift - 1;
+    return (proto_ts / simbricks->sync_drift) + simbricks->ts_base;
 }
 
 static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
@@ -139,7 +149,7 @@ static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
 {
     volatile union SimbricksProtoPcieH2D *msg;
     while (!(msg = SimbricksPcieIfH2DOutAlloc(&simbricks->pcieif,
-                                              ts_to_proto(simbricks, ts))));
+        ts_to_proto(simbricks, ts, true))));
 
     // whenever we send a message, we need to reschedule our sync timer
     simbricks->sync_ts_bumped = true;
@@ -156,6 +166,12 @@ static void simbricks_comm_d2h_dma_read(
 {
     volatile union SimbricksProtoPcieH2D *h2d;
     volatile struct SimbricksProtoPcieH2DReadcomp *rc;
+
+#ifdef DEBUG_PRINTS
+    warn_report(
+        "simbricks_comm_d2h_dma_read: addr=%lx len=%x", read->offset,
+                read->len);
+#endif
 
     /* allocate completion */
     h2d = simbricks_comm_h2d_alloc(simbricks, ts);
@@ -315,9 +331,7 @@ static void simbricks_timer_poll(void *data)
     int64_t cur_ts, next_ts, proto_ts;
 
     cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
-    proto_ts = ts_to_proto(simbricks, cur_ts + 1); // + 1 to avoid getting stuck
-                                                   // on off by ones due to of
-                                                   // rounding
+    proto_ts = ts_to_proto(simbricks, cur_ts, true);
 #ifdef DEBUG_PRINTS
     uint64_t poll_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
     if (proto_ts > poll_ts + 1 || proto_ts < poll_ts)
@@ -335,20 +349,20 @@ static void simbricks_timer_poll(void *data)
     /* wait for next message so we know its timestamp and when to schedule the
      * timer. */
     do {
-        next_msg = SimbricksPcieIfD2HInPeek(&simbricks->pcieif, proto_ts);
-        next_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
-    } while (!next_msg && next_ts <= proto_ts);
+        next_msg = SimbricksPcieIfD2HInPeek(&simbricks->pcieif, UINT64_MAX);
+    } while (!next_msg);
+    next_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
 
     /* set timer for next message */
     /* we need to do this before actually processing the message, in order to
      * have a timer set to prevent the clock from running away from us. We set a
      * dummy timer with the current ts to prevent the clock from jumping */
     timer_mod_ns(simbricks->timer_dummy, cur_ts);
-    timer_mod_ns(simbricks->timer_poll, ts_from_proto(simbricks, next_ts));
+    timer_mod_ns(simbricks->timer_poll, ts_from_proto(simbricks, next_ts, false));
     if (simbricks->sync_ts_bumped) {
         timer_mod_ns(simbricks->timer_sync,
             ts_from_proto(simbricks,
-                SimbricksBaseIfOutNextSync(&simbricks->pcieif.base)));
+                SimbricksBaseIfOutNextSync(&simbricks->pcieif.base), false));
         simbricks->sync_ts_bumped = false;
     }
 
@@ -372,7 +386,7 @@ static void simbricks_timer_sync(void *data)
     uint64_t proto_ts;
 
     cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
-    proto_ts = ts_to_proto(simbricks, cur_ts);
+    proto_ts = ts_to_proto(simbricks, cur_ts, true);
 
 #ifdef DEBUG_PRINTS
     uint64_t sync_ts = SimbricksPcieIfH2DOutNextSync(&simbricks->pcieif);
@@ -393,7 +407,7 @@ static void simbricks_timer_sync(void *data)
                     cur_ts, now_ts);
 #endif
     uint64_t next_sync_pts = SimbricksPcieIfH2DOutNextSync(&simbricks->pcieif);
-    uint64_t next_sync_ts = ts_from_proto(simbricks, next_sync_pts);
+    uint64_t next_sync_ts = ts_from_proto(simbricks, next_sync_pts, false);
 #ifdef DEBUG_PRINTS
     warn_report("simbricks_timer_sync: next pts=%lu ts=%lu", next_sync_pts,
         next_sync_ts);
@@ -710,15 +724,16 @@ static int simbricks_connect(SimbricksPciState *simbricks, Error **errp)
         simbricks->timer_dummy =
             timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_dummy, simbricks);
 
-        simbricks->ts_base = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+        simbricks->ts_base = qemu_clock_get_ns(SIMBRICKS_CLOCK) +
+            simbricks->sync_offset;
         simbricks->timer_sync =
             timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_sync, simbricks);
         timer_mod_ns(simbricks->timer_sync,
-            ts_from_proto(simbricks, first_sync_ts));
+            ts_from_proto(simbricks, first_sync_ts, false));
         simbricks->timer_poll =
             timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_poll, simbricks);
         timer_mod_ns(simbricks->timer_poll,
-            ts_from_proto(simbricks, first_msg_ts));
+            ts_from_proto(simbricks, first_msg_ts, false));
     } else {
         qemu_thread_create(&simbricks->thread, "simbricks-poll",
                 simbricks_poll_thread, simbricks, QEMU_THREAD_JOINABLE);
@@ -864,6 +879,8 @@ static Property simbricks_pci_dev_properties[] = {
   DEFINE_PROP_BOOL("sync", SimbricksPciState, sync, false),
   DEFINE_PROP_INT32("sync-mode", SimbricksPciState, sync_mode,
       SIMBRICKS_PROTO_SYNC_SIMBRICKS),
+  DEFINE_PROP_UINT64("sync-drift", SimbricksPciState, sync_drift, 1000),
+  DEFINE_PROP_UINT64("sync-offset", SimbricksPciState, sync_offset, 0),
   DEFINE_PROP_UINT64("pci-latency", SimbricksPciState, pci_latency, 500),
   DEFINE_PROP_UINT64("sync-period", SimbricksPciState, sync_period, 500),
   DEFINE_PROP_END_OF_LIST(),
