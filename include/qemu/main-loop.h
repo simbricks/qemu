@@ -27,7 +27,7 @@
 
 #include "block/aio.h"
 
-#define SIG_IPI SIGUSR1
+#define SIG_IPI SIGUSR2
 
 /**
  * qemu_init_main_loop: Set up the process so that it can run the main loop.
