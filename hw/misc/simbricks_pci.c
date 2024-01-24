@@ -40,6 +40,7 @@
 #include "sysemu/cpus.h"
 #include "hw/core/cpu.h"
 
+#include <signal.h>
 #include <simbricks/pcie/if.h>
 
 //#define DEBUG_PRINTS
@@ -155,6 +156,42 @@ static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
     simbricks->sync_ts_bumped = true;
     return msg;
 }
+
+static inline uint64_t rdtsc(void) {
+    uint32_t eax, edx;
+    asm volatile ("rdtsc" : "=a" (eax), "=d" (edx));
+    return ((uint64_t) edx << 32) | eax;
+}
+
+
+static void sigusr_print(int sig)
+{
+    SimbricksPciState *simbricks = simbricks_all;
+    printf("STATS: tsc=%lu\n", rdtsc());
+
+    for (simbricks = simbricks_all; simbricks;
+            simbricks = simbricks->next_simbricks) {
+        printf("  %s: main_time=%lu\n", simbricks->socket_path,
+            ts_to_proto(simbricks, qemu_clock_get_ns(SIMBRICKS_CLOCK), true));
+    }
+}
+
+static void sighandler_register(void)
+{
+    struct sigaction action;
+    sigset_t set;
+
+    memset(&action, 0, sizeof(action));
+    sigfillset(&action.sa_mask);
+    action.sa_handler = sigusr_print;
+    action.sa_flags = 0;
+    sigaction(SIGUSR1, &action, NULL);
+
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+}
+
 
 /******************************************************************************/
 /* Worker thread */
@@ -923,6 +960,7 @@ static void pci_simbricks_register_types(void)
     };
 
     type_register_static(&simbricks_info);
+    sighandler_register();
 }
 type_init(pci_simbricks_register_types)
 
