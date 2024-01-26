@@ -104,6 +104,13 @@ typedef struct SimbricksPciState {
     QEMUTimer *timer_sync;
     QEMUTimer *timer_poll;
 
+    uint64_t cycles_tx_block;
+    uint64_t cycles_tx_comm;
+    uint64_t cycles_tx_sync;
+    uint64_t cycles_tx_start_tsc;
+    uint64_t cycles_rx_block;
+    uint64_t cycles_rx_comm;
+
     struct SimbricksPciState *next_simbricks;
 } SimbricksPciState;
 
@@ -144,25 +151,37 @@ static inline int64_t ts_from_proto(SimbricksPciState *simbricks,
     return (proto_ts / simbricks->sync_drift) + simbricks->ts_base;
 }
 
-static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
-        SimbricksPciState *simbricks,
-        uint64_t ts)
-{
-    volatile union SimbricksProtoPcieH2D *msg;
-    while (!(msg = SimbricksPcieIfH2DOutAlloc(&simbricks->pcieif,
-        ts_to_proto(simbricks, ts, true))));
-
-    // whenever we send a message, we need to reschedule our sync timer
-    simbricks->sync_ts_bumped = true;
-    return msg;
-}
-
 static inline uint64_t rdtsc(void) {
     uint32_t eax, edx;
     asm volatile ("rdtsc" : "=a" (eax), "=d" (edx));
     return ((uint64_t) edx << 32) | eax;
 }
 
+static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
+        SimbricksPciState *simbricks,
+        uint64_t ts)
+{
+    volatile union SimbricksProtoPcieH2D *msg;
+    uint64_t start_tsc = rdtsc();
+    uint64_t block_tsc = start_tsc;
+    while (!(msg = SimbricksPcieIfH2DOutAlloc(&simbricks->pcieif,
+        ts_to_proto(simbricks, ts, true))))
+      block_tsc = start_tsc;
+
+    // whenever we send a message, we need to reschedule our sync timer
+    simbricks->sync_ts_bumped = true;
+
+    simbricks->cycles_tx_block = block_tsc - start_tsc;
+    simbricks->cycles_tx_start_tsc = block_tsc;
+    return msg;
+}
+
+static inline void simbricks_comm_h2d_send(SimbricksPciState *simbricks,
+    volatile union SimbricksProtoPcieH2D *h2d, uint8_t ty)
+{
+    SimbricksPcieIfH2DOutSend(&simbricks->pcieif, h2d, ty);
+    simbricks->cycles_tx_comm += rdtsc() - simbricks->cycles_tx_start_tsc;
+}
 
 static void sigusr_print(int sig)
 {
@@ -171,8 +190,13 @@ static void sigusr_print(int sig)
 
     for (simbricks = simbricks_all; simbricks;
             simbricks = simbricks->next_simbricks) {
-        printf("  %s: main_time=%lu\n", simbricks->socket_path,
-            ts_to_proto(simbricks, qemu_clock_get_ns(SIMBRICKS_CLOCK), true));
+        printf("  %s: main_time=%lu tx_comm_cycles=%lu tx_block_cycles=%lu "
+               "tx_sync_cycles=%lu rx_comm_cycles=%lu rx_block_cycles=%lu\n",
+            simbricks->socket_path,
+            ts_to_proto(simbricks, qemu_clock_get_ns(SIMBRICKS_CLOCK), true),
+            simbricks->cycles_tx_comm, simbricks->cycles_tx_block,
+            simbricks->cycles_tx_sync, simbricks->cycles_rx_comm,
+            simbricks->cycles_rx_block);
     }
 }
 
@@ -222,7 +246,7 @@ static void simbricks_comm_d2h_dma_read(
 
     /* return completion */
     rc->req_id = read->req_id;
-    SimbricksPcieIfH2DOutSend(&simbricks->pcieif, h2d,
+    simbricks_comm_h2d_send(simbricks, h2d,
         SIMBRICKS_PROTO_PCIE_H2D_MSG_READCOMP);
 }
 
@@ -244,7 +268,7 @@ static void simbricks_comm_d2h_dma_write(
 
     /* return completion */
     wc->req_id = write->req_id;
-    SimbricksPcieIfH2DOutSend(&simbricks->pcieif, h2d,
+    simbricks_comm_h2d_send(simbricks, h2d,
         SIMBRICKS_PROTO_PCIE_H2D_MSG_WRITECOMP);
 }
 
@@ -367,6 +391,7 @@ static void simbricks_timer_poll(void *data)
     volatile union SimbricksProtoPcieD2H *next_msg;
     int64_t cur_ts, next_ts, proto_ts;
 
+    uint64_t start_tsc = rdtsc();
     cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
     proto_ts = ts_to_proto(simbricks, cur_ts, true);
 #ifdef DEBUG_PRINTS
@@ -383,12 +408,18 @@ static void simbricks_timer_poll(void *data)
         msg = SimbricksPcieIfD2HInPoll(&simbricks->pcieif, proto_ts);
     } while (msg == NULL);
 
+    uint64_t wait_tsc = rdtsc();
+    simbricks->cycles_rx_comm += wait_tsc - start_tsc;
+
     /* wait for next message so we know its timestamp and when to schedule the
      * timer. */
     do {
         next_msg = SimbricksPcieIfD2HInPeek(&simbricks->pcieif, UINT64_MAX);
     } while (!next_msg);
     next_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
+
+    start_tsc = rdtsc();
+    simbricks->cycles_rx_block += start_tsc - wait_tsc;
 
     /* set timer for next message */
     /* we need to do this before actually processing the message, in order to
@@ -402,6 +433,8 @@ static void simbricks_timer_poll(void *data)
                 SimbricksBaseIfOutNextSync(&simbricks->pcieif.base), false));
         simbricks->sync_ts_bumped = false;
     }
+
+    simbricks->cycles_rx_comm += rdtsc() - start_tsc;
 
     /* now process the message */
     simbricks_comm_d2h_process(simbricks, cur_ts, msg);
@@ -421,6 +454,7 @@ static void simbricks_timer_sync(void *data)
     SimbricksPciState *simbricks = data;
     int64_t cur_ts;
     uint64_t proto_ts;
+    uint64_t start_tsc = rdtsc();
 
     cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
     proto_ts = ts_to_proto(simbricks, cur_ts, true);
@@ -450,6 +484,8 @@ static void simbricks_timer_sync(void *data)
         next_sync_ts);
 #endif
     timer_mod_ns(simbricks->timer_sync, next_sync_ts);
+
+    simbricks->cycles_tx_sync += rdtsc() - start_tsc;
 }
 
 static void *simbricks_poll_thread(void *opaque)
@@ -543,7 +579,7 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
         /* FIXME: this probably only works for LE */
         memcpy((void *) write->data, val, size);
 
-        SimbricksPcieIfH2DOutSend(&simbricks->pcieif, msg,
+        simbricks_comm_h2d_send(simbricks, msg,
             SIMBRICKS_PROTO_PCIE_H2D_MSG_WRITE);
 
 #ifdef DEBUG_PRINTS
@@ -561,7 +597,7 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
         read->len = size;
         read->bar = bar;
 
-        SimbricksPcieIfH2DOutSend(&simbricks->pcieif, msg,
+        simbricks_comm_h2d_send(simbricks, msg,
             SIMBRICKS_PROTO_PCIE_H2D_MSG_READ);
 
         /* start processing request */
@@ -665,7 +701,7 @@ static void simbricks_config_write(PCIDevice *dev,
         if (msix_after)
             devctrl->flags |= SIMBRICKS_PROTO_PCIE_CTRL_MSIX_EN;
 
-        SimbricksPcieIfH2DOutSend(&simbricks->pcieif, msg,
+        simbricks_comm_h2d_send(simbricks, msg,
             SIMBRICKS_PROTO_PCIE_H2D_MSG_DEVCTRL);
     }
 }
