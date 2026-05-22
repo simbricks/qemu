@@ -1314,6 +1314,9 @@ static int (* const net_client_init_fun[NET_CLIENT_DRIVER__MAX])(
         [NET_CLIENT_DRIVER_VMNET_SHARED] = net_init_vmnet_shared,
         [NET_CLIENT_DRIVER_VMNET_BRIDGED] = net_init_vmnet_bridged,
 #endif /* CONFIG_VMNET */
+#ifdef CONFIG_SIMBRICKS_ETH
+        [NET_CLIENT_DRIVER_SIMBRICKS_ETH] = net_init_simbricks,
+#endif /* CONFIG_SIMBRICKS_ETH */
 };
 
 
@@ -1414,6 +1417,9 @@ void show_netdevs(void)
         "vmnet-host",
         "vmnet-shared",
         "vmnet-bridged",
+#endif
+#ifdef CONFIG_SIMBRICKS_ETH
+        "simbricks-eth",
 #endif
     };
 

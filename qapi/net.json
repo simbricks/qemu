@@ -826,6 +826,21 @@
     '*local':  'SocketAddress',
     '*remote': 'SocketAddress' } }
 
+
+##
+# @NetdevSimbricksOptions:
+#
+# Connect to a SimBricks network adapter
+#
+# @sock-path: Encoded SimBricks parameter string
+#
+# Since: 11.0
+##
+{ 'struct': 'NetdevSimbricksOptions',
+  'data': {
+    'sock-path': 'str' },
+  'if': 'CONFIG_SIMBRICKS_ETH' }
+
 ##
 # @NetClientDriver:
 #
@@ -859,7 +874,8 @@
             { 'name': 'af-xdp', 'if': 'CONFIG_AF_XDP' },
             { 'name': 'vmnet-host', 'if': 'CONFIG_VMNET' },
             { 'name': 'vmnet-shared', 'if': 'CONFIG_VMNET' },
-            { 'name': 'vmnet-bridged', 'if': 'CONFIG_VMNET' }] }
+            { 'name': 'vmnet-bridged', 'if': 'CONFIG_VMNET' },
+            { 'name': 'simbricks-eth', 'if': 'CONFIG_SIMBRICKS_ETH' }] }
 
 ##
 # @Netdev:
@@ -898,7 +914,9 @@
     'vmnet-shared': { 'type': 'NetdevVmnetSharedOptions',
                       'if': 'CONFIG_VMNET' },
     'vmnet-bridged': { 'type': 'NetdevVmnetBridgedOptions',
-                       'if': 'CONFIG_VMNET' } } }
+                       'if': 'CONFIG_VMNET' },
+    'simbricks-eth': { 'type': 'NetdevSimbricksOptions',
+                       'if': 'CONFIG_SIMBRICKS_ETH' } } }
 
 ##
 # @RxState:

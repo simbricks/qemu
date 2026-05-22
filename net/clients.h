@@ -89,4 +89,9 @@ int net_init_vmnet_bridged(const Netdev *netdev, const char *name,
                           NetClientState *peer, Error **errp);
 #endif /* CONFIG_VMNET */
 
+#ifdef CONFIG_SIMBRICKS_ETH
+int net_init_simbricks(const Netdev *netdev, const char *name,
+                       NetClientState *peer, Error **errp);
+#endif
+
 #endif /* QEMU_NET_CLIENTS_H */
