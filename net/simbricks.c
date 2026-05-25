@@ -11,6 +11,8 @@
 #include <simbricks/network/if.h>
 #include <simbricks/parser/parser.h>
 
+#define SIMBRICKS_ETH_DEBUG
+
 #define SIMBRICKS_CLOCK QEMU_CLOCK_VIRTUAL
 
 typedef struct SimbricksEthState
@@ -22,6 +24,7 @@ typedef struct SimbricksEthState
     int64_t ts_base;
     QEMUTimer *poll_timer;
     QEMUTimer *sync_timer;
+    QEMUTimer *timer_dummy;
 } SimbricksEthState;
 
 static inline uint64_t ts_to_proto(SimbricksEthState *simbricks,
@@ -71,11 +74,6 @@ static ssize_t simbricks_receive(NetClientState *nc, const uint8_t *buf, size_t 
         return 0;
     }
 
-    if (simbricks->sync) {
-        // re-schedule sync timer if we send out a message
-        timer_mod_ns(simbricks->sync_timer, ts_from_proto(simbricks, SimbricksNetIfOutNextSync(&simbricks->netif)));
-    }
-
     /* Copy payload into SimBricks shared memory */
     volatile struct SimbricksProtoNetMsgPacket *pkt = &msg->packet;
     pkt->len = size;
@@ -84,6 +82,11 @@ static ssize_t simbricks_receive(NetClientState *nc, const uint8_t *buf, size_t 
 
     /* Commit the packet to the queue */
     SimbricksNetIfOutSend(&simbricks->netif, msg, SIMBRICKS_PROTO_NET_MSG_PACKET);
+
+    if (simbricks->sync) {
+        // re-schedule sync timer if we send out a message
+        timer_mod_ns(simbricks->sync_timer, ts_from_proto(simbricks, SimbricksNetIfOutNextSync(&simbricks->netif)));
+    }
 
     return size;
 }
@@ -96,10 +99,18 @@ static void handle_and_free_n2q_msg(SimbricksEthState *simbricks, volatile union
     }
 
     uint8_t type = SimbricksNetIfInType(&simbricks->netif, msg);
-    if (type == SIMBRICKS_PROTO_NET_MSG_PACKET)
-    {
-        volatile struct SimbricksProtoNetMsgPacket *pkt = &msg->packet;
-        qemu_send_packet(&simbricks->nc, (const uint8_t *)pkt->data, pkt->len);
+
+    switch (type) {
+        case SIMBRICKS_PROTO_MSG_TYPE_SYNC:
+            /* nop */
+            break;
+        case SIMBRICKS_PROTO_NET_MSG_PACKET:
+            volatile struct SimbricksProtoNetMsgPacket *pkt = &msg->packet;
+            qemu_send_packet(&simbricks->nc, (const uint8_t *)pkt->data, pkt->len);
+            break;
+        default:
+            fprintf(stderr, "simbricks-eth: handle_and_free_n2q_msg: unhandled type");
+            return;
     }
 
     SimbricksNetIfInDone(&simbricks->netif, msg);
@@ -138,10 +149,17 @@ static void simbricks_poll(void *opaque)
      * SYNCHRONIZED MODE
      * ========================================== */
 
+#ifdef SIMBRICKS_ETH_DEBUG
+    fprintf(stderr, "simbricks-eth: [poll] Entering wait for msg at ts %ld...\n", cur_ts);
+#endif
     while (msg == NULL)
     {
+
         msg = SimbricksNetIfInPoll(&simbricks->netif, proto_ts);
     }
+#ifdef SIMBRICKS_ETH_DEBUG
+    fprintf(stderr, "simbricks-eth: [poll] Got msg! Entering wait for next_msg...\n");
+#endif
 
     /* wait for next message so we know its timestamp and when to schedule the timer. */
     do
@@ -150,11 +168,23 @@ static void simbricks_poll(void *opaque)
         next_ts = SimbricksNetIfInTimestamp(&simbricks->netif);
     } while (!next_msg && next_ts <= proto_ts);
 
+#ifdef SIMBRICKS_ETH_DEBUG
+    fprintf(stderr, "simbricks-eth: [poll] Wait complete! Rescheduling...\n");
+#endif
+
+    timer_mod_ns(simbricks->timer_dummy, cur_ts);
+    /* set timer for next message */
+    timer_mod_ns(simbricks->poll_timer, ts_from_proto(simbricks, next_ts));
+
     /* now process the message */
     handle_and_free_n2q_msg(simbricks, msg);
 
-    /* set timer for next message */
-    timer_mod_ns(simbricks->poll_timer, ts_from_proto(simbricks, next_ts));
+#ifdef SIMBRICKS_ETH_DEBUG
+    int64_t now_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+    if (cur_ts != now_ts)
+        fprintf(stderr, "\n\n\nsimbricks_timer_poll: time advanced from %lu to %lu\n\n\n",
+                    cur_ts, now_ts);
+#endif
 
     return;
 }
@@ -172,7 +202,13 @@ static void simbricks_cleanup(NetClientState *nc)
     {
         timer_free(simbricks->sync_timer);
     }
+    if (simbricks->timer_dummy)
+    {
+        timer_free(simbricks->timer_dummy);
+    }
 }
+
+static void simbricks_timer_dummy(void *opaque) {}
 
 /* Define the NetClientInfo interface */
 static NetClientInfo net_simbricks_info = {
@@ -224,6 +260,11 @@ int net_init_simbricks(const Netdev *netdev, const char *name,
         return -1;
     }
 
+    simbricks->sync = simbricks->netif.base.sync;
+
+    simbricks->netif.base.params.sync_interval *= 1000ULL;
+    simbricks->netif.base.params.link_latency *= 1000ULL;
+
     if (simbricks->sync)
     {
         /* send a first sync */
@@ -244,6 +285,9 @@ int net_init_simbricks(const Netdev *netdev, const char *name,
         
         /* Set up the virtual timer for polling */
         simbricks->ts_base = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+
+        simbricks->timer_dummy =
+            timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_dummy, simbricks);
     
         simbricks->sync_timer = timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_sync_cb, simbricks);
         timer_mod_ns(simbricks->sync_timer, ts_from_proto(simbricks, first_sync_ts));
