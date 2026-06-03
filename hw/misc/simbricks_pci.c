@@ -26,8 +26,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
-#include "hw/hw.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
 #include "qemu/error-report.h"
@@ -37,8 +36,9 @@
 #include "chardev/char-fe.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
-#include "sysemu/cpus.h"
+#include "system/cpus.h"
 #include "hw/core/cpu.h"
+#include "exec/cpu-common.h"
 
 #include <simbricks/pcie/if.h>
 
@@ -105,8 +105,6 @@ typedef struct SimbricksPciState {
 
 static SimbricksPciState *simbricks_all = NULL;
 void simbricks_cleanup(void);
-
-void QEMU_NORETURN cpu_loop_exit(CPUState *cpu);
 
 static void panic(const char *msg, ...) __attribute__((noreturn));
 
@@ -251,7 +249,7 @@ static void simbricks_comm_d2h_rcomp(SimbricksPciState *simbricks,
 #endif
 
         cpu->stopped = 0;
-        //qemu_cpu_kick(cpu);
+        qemu_cpu_kick(cpu);
     } else {
         qemu_cond_broadcast(&req->cond);
     }
@@ -415,9 +413,9 @@ static void *simbricks_poll_thread(void *opaque)
 
         /* actually process the operation. this needs to be done with the I/O
          * lock held. */
-        qemu_mutex_lock_iothread();
+        bql_lock();
         simbricks_comm_d2h_process(simbricks, 0, msg);
-        qemu_mutex_unlock_iothread();
+        bql_unlock();
     }
 
     return NULL;
@@ -531,8 +529,9 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
             cpu->stopped = 1;
             cpu_loop_exit(cpu);
         } else {
-            while (req->processing)
-                qemu_cond_wait_iothread(&req->cond);
+            while (req->processing) {
+                qemu_cond_wait_bql(&req->cond);
+            }
 
             *val = req->value;
             req->requested = false;
@@ -796,6 +795,17 @@ static void pci_simbricks_realize(PCIDevice *pdev, Error **errp)
 
         memory_region_init_io(&simbricks->mmio_bars[i], OBJECT(simbricks),
                 &simbricks_mmio_ops, &simbricks->bar_info[i], label, len);
+
+        /* For devices designed to perform re-entrant IO into their own IO MRs.
+         * Here we disable QEMU's strict re-entrancy guard to allow concurrent 
+         * vCPU accesses while the BQL is dropped waiting for the simulator.
+         *
+         * This happens e.g. when 'simbricks_mmio_rw' is called by different vCPUs
+         * to read a device register and drops the global QEMU lock
+         * ('qemu_cond_wait_bql') waiting for an answer from an attached simulator. 
+        */
+        simbricks->mmio_bars[i].disable_reentrancy_guard = true;
+
         pci_register_bar(pdev, i, attr, &simbricks->mmio_bars[i]);
     }
 
@@ -814,10 +824,7 @@ static void pci_simbricks_realize(PCIDevice *pdev, Error **errp)
         }
 
         for (i = 0; i < simbricks->dev_intro.pci_msix_nvecs; i++) {
-            if (msix_vector_use(pdev, i)) {
-                error_setg(errp, "simbricks_connect: msix_vector_use failed");
-                return;
-            }
+            msix_vector_use(pdev, i);
         }
     }
 
@@ -859,17 +866,16 @@ static void simbricks_pci_instance_init(Object *obj)
 {
 }
 
-static Property simbricks_pci_dev_properties[] = {
+static const Property simbricks_pci_dev_properties[] = {
   DEFINE_PROP_STRING("socket", SimbricksPciState, socket_path),
   DEFINE_PROP_BOOL("sync", SimbricksPciState, sync, false),
   DEFINE_PROP_INT32("sync-mode", SimbricksPciState, sync_mode,
       SIMBRICKS_PROTO_SYNC_SIMBRICKS),
   DEFINE_PROP_UINT64("pci-latency", SimbricksPciState, pci_latency, 500),
   DEFINE_PROP_UINT64("sync-period", SimbricksPciState, sync_period, 500),
-  DEFINE_PROP_END_OF_LIST(),
 };
 
-static void simbricks_pci_class_init(ObjectClass *class, void *data)
+static void simbricks_pci_class_init(ObjectClass *class, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(class);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(class);

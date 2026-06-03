@@ -392,3 +392,7 @@ option('rust', type: 'feature', value: 'disabled',
        description: 'Rust support')
 option('strict_rust_lints', type: 'boolean', value: false,
        description: 'Enable stricter set of Rust warnings')
+
+# SimBricks
+option('simbricks', type: 'feature', value: 'auto', description: 'SimBricks library support')
+option('simbricks_pci', type: 'feature', value: 'disabled', description: 'SimBricks PCIe device adapter support')

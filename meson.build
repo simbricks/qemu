@@ -2289,6 +2289,21 @@ if not get_option('libdw').auto() or \
                        required: get_option('libdw'))
 endif
 
+# SimBricks library probe
+simbricks = not_found
+if not get_option('simbricks').disabled()
+  # Look for -lsimbricks
+  simbricks = cc.find_library('simbricks', required: get_option('simbricks'))
+  
+  # Ensure the header actually exists
+  if simbricks.found() and not cc.has_header('simbricks/base/if.h', dependencies: simbricks)
+    if get_option('simbricks').enabled()
+      error('libsimbricks devel headers not found')
+    endif
+    simbricks = not_found
+  endif
+endif
+
 #################
 # config-host.h #
 #################
@@ -3242,6 +3257,10 @@ if host_os == 'windows' and 'cpp' in all_languages
   ''')
   config_host_data.set('CONFIG_CONVERT_STRING_TO_BSTR', has_convert_string_to_bstr)
 endif
+
+# SimBricks config
+config_host_data.set('CONFIG_LIBSIMBRICKS', simbricks.found())
+config_host_data.set('CONFIG_SIMBRICKS_PCI', get_option('simbricks_pci').allowed() and simbricks.found())
 
 ########################
 # Target configuration #
