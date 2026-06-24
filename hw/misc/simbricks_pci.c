@@ -144,6 +144,19 @@ static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
     return msg;
 }
 
+static inline void simbricks_suspend_cpu(CPUState *cpu) {
+    cpu->stop = true;
+    cpu->stopped = true;
+    cpu_loop_exit(cpu);
+}
+
+static inline void simbricks_resume_cpu(CPUState *cpu) {
+    cpu->stop = false;
+    cpu->stopped = false;
+    // qemu_cpu_kick(cpu);  
+    cpu_resume(cpu);
+}
+
 /******************************************************************************/
 /* Worker thread */
 
@@ -248,8 +261,7 @@ static void simbricks_comm_d2h_rcomp(SimbricksPciState *simbricks,
                 req_id, cur_ts);
 #endif
 
-        cpu->stopped = 0;
-        qemu_cpu_kick(cpu);
+        simbricks_resume_cpu(cpu);
     } else {
         qemu_cond_broadcast(&req->cond);
     }
@@ -453,8 +465,8 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
 
         if (req->processing) {
             /* request in progress, we have to wait */
-            cpu->stopped = 1;
-            cpu_loop_exit(cpu);
+            simbricks_suspend_cpu(cpu);
+
         } else if (req->addr == addr && req->bar == bar && req->size == size) {
             /* request finished */
 #ifdef DEBUG_PRINTS
@@ -526,8 +538,7 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
 #endif
 
         if (simbricks->sync) {
-            cpu->stopped = 1;
-            cpu_loop_exit(cpu);
+            simbricks_suspend_cpu(cpu);
         } else {
             while (req->processing) {
                 qemu_cond_wait_bql(&req->cond);
