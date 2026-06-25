@@ -145,16 +145,12 @@ static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
 }
 
 static inline void simbricks_suspend_cpu(CPUState *cpu) {
-    cpu->stop = true;
-    cpu->stopped = true;
+    cpu->halted = 1;
     cpu_loop_exit(cpu);
 }
 
 static inline void simbricks_resume_cpu(CPUState *cpu) {
-    cpu->stop = false;
-    cpu->stopped = false;
-    // qemu_cpu_kick(cpu);  
-    cpu_resume(cpu);
+    cpu->halted = 0;
 }
 
 /******************************************************************************/
