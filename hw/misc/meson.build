@@ -168,7 +168,7 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
 system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
 # SimBricks PCI_E
-system_ss.add(when: 'CONFIG_SIMBRICKS_PCI', if_true: [files('simbricks_pci.c'), simbricks])
+system_ss.add(when: 'CONFIG_SIMBRICKS_PCI', if_true: [files('simbricks_pci.c', 'simbricks_helper.c'), simbricks])
 if get_option('simbricks_pci').allowed() and simbricks.found()
-  system_ss.add(files('simbricks_pci.c'), simbricks)
+  system_ss.add(files('simbricks_pci.c', 'simbricks_helper.c'), simbricks)
 endif

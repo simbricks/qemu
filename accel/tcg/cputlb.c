@@ -53,6 +53,7 @@
 #include "tcg/tcg-ldst.h"
 #include "backend-ldst.h"
 
+#include "hw/misc/simbricks_helper.h"
 
 /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
 /* #define DEBUG_TLB */
@@ -1949,8 +1950,10 @@ static uint64_t int_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
         this_size = 1 << this_mop;
         this_mop |= MO_BE;
 
+        simbricks_set_tcg_retaddr(ra);
         r = memory_region_dispatch_read(mr, mr_offset, &val,
                                         this_mop, full->attrs);
+        simbricks_set_tcg_retaddr(0);
         if (unlikely(r != MEMTX_OK)) {
             io_failed(cpu, full, addr, this_size, type, mmu_idx, r, ra);
         }
@@ -2462,8 +2465,11 @@ static uint64_t int_st_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
         this_size = 1 << this_mop;
         this_mop |= MO_LE;
 
+        simbricks_set_tcg_retaddr(ra);
         r = memory_region_dispatch_write(mr, mr_offset, val_le,
                                          this_mop, full->attrs);
+        simbricks_set_tcg_retaddr(0);
+
         if (unlikely(r != MEMTX_OK)) {
             io_failed(cpu, full, addr, this_size, MMU_DATA_STORE,
                       mmu_idx, r, ra);

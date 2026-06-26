@@ -23,6 +23,7 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#include "assert.h"
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "hw/pci/pci.h"
@@ -39,6 +40,8 @@
 #include "system/cpus.h"
 #include "hw/core/cpu.h"
 #include "exec/cpu-common.h"
+
+#include "hw/misc/simbricks_helper.h"
 
 #include <simbricks/pcie/if.h>
 
@@ -142,15 +145,6 @@ static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
     // whenever we send a message, we need to reschedule our sync timer
     simbricks->sync_ts_bumped = true;
     return msg;
-}
-
-static inline void simbricks_suspend_cpu(CPUState *cpu) {
-    cpu->halted = 1;
-    cpu_loop_exit(cpu);
-}
-
-static inline void simbricks_resume_cpu(CPUState *cpu) {
-    cpu->halted = 0;
 }
 
 /******************************************************************************/
