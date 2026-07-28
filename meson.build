@@ -3261,6 +3261,7 @@ endif
 # SimBricks config
 config_host_data.set('CONFIG_LIBSIMBRICKS', simbricks.found())
 config_host_data.set('CONFIG_SIMBRICKS_PCI', get_option('simbricks_pci').allowed() and simbricks.found())
+config_host_data.set('CONFIG_SIMBRICKS_ETH', get_option('simbricks_eth').allowed() and simbricks.found())
 
 ########################
 # Target configuration #

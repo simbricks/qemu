@@ -71,4 +71,10 @@ vmnet_files = files(
   'vmnet-shared.c'
 )
 system_ss.add(when: vmnet, if_true: vmnet_files)
+
+# SimBricks ethernet adapter
+if get_option('simbricks_eth').allowed() and simbricks.found()
+  system_ss.add(files('simbricks.c'), simbricks)
+endif
+
 subdir('can')
