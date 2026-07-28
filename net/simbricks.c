@@ -11,7 +11,7 @@
 #include <simbricks/network/if.h>
 #include <simbricks/parser/parser.h>
 
-#define SIMBRICKS_ETH_DEBUG
+// #define SIMBRICKS_ETH_DEBUG
 
 #define SIMBRICKS_CLOCK QEMU_CLOCK_VIRTUAL
 
