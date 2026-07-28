@@ -187,6 +187,7 @@ meson_options_help() {
   printf "%s\n" '  selinux         SELinux support in qemu-nbd'
   printf "%s\n" '  simbricks       SimBricks library support'
   printf "%s\n" '  simbricks-pci   SimBricks PCIe device adapter support'
+  printf "%s\n" '  simbricks-eth   SimBricks ethernet adapter support'
   printf "%s\n" '  slirp           libslirp user mode network backend support'
   printf "%s\n" '  slirp-smbd      use smbd (at path --smbd=*) in slirp networking'
   printf "%s\n" '  smartcard       CA smartcard emulation support'
@@ -495,6 +496,8 @@ _meson_option_parse() {
     --disable-simbricks) printf "%s" -Dsimbricks=disabled ;;
     --enable-simbricks-pci) printf "%s" -Dsimbricks_pci=enabled ;;
     --disable-simbricks-pci) printf "%s" -Dsimbricks_pci=disabled ;;
+    --enable-simbricks-eth) printf "%s" -Dsimbricks_eth=enabled ;;
+    --disable-simbricks-eth) printf "%s" -Dsimbricks_eth=disabled ;;
     --enable-slirp) printf "%s" -Dslirp=enabled ;;
     --disable-slirp) printf "%s" -Dslirp=disabled ;;
     --enable-slirp-smbd) printf "%s" -Dslirp_smbd=enabled ;;

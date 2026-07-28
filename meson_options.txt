@@ -396,3 +396,4 @@ option('strict_rust_lints', type: 'boolean', value: false,
 # SimBricks
 option('simbricks', type: 'feature', value: 'auto', description: 'SimBricks library support')
 option('simbricks_pci', type: 'feature', value: 'disabled', description: 'SimBricks PCIe device adapter support')
+option('simbricks_eth', type: 'feature', value: 'disabled', description: 'SimBricks ethernet adapter support')

@@ -215,7 +215,6 @@ static NetClientInfo net_simbricks_info = {
     .type = NET_CLIENT_DRIVER_SIMBRICKS_ETH,
     .size = sizeof(SimbricksEthState),
     .receive = simbricks_receive,
-    .receive_raw = simbricks_receive,
     .cleanup = simbricks_cleanup,
 };
 
