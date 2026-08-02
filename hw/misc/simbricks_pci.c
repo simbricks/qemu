@@ -30,6 +30,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
+#include "hw/pci/pcie.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h" /* iothread mutex */
@@ -52,6 +53,10 @@
 #define TYPE_PCI_SIMBRICKS_DEVICE "simbricks-pci"
 #define SIMBRICKS_PCI(obj) \
     OBJECT_CHECK(SimbricksPciState, obj, TYPE_PCI_SIMBRICKS_DEVICE)
+#define SIMBRICKS_PCI_CLASS(klass) \
+    OBJECT_CLASS_CHECK(SimbricksPciClass, klass, TYPE_PCI_SIMBRICKS_DEVICE)
+#define SIMBRICKS_PCI_GET_CLASS(obj) \
+    OBJECT_GET_CLASS(SimbricksPciClass, obj, TYPE_PCI_SIMBRICKS_DEVICE)
 
 typedef struct SimbricksPciBarInfo {
     struct SimbricksPciState *simbricks;
@@ -81,6 +86,7 @@ typedef struct SimbricksPciState {
     char *socket_path;      /* path to ux socket to connect to */
     uint64_t pci_latency;
     uint64_t sync_period;
+    bool pcie;              /* expose a PCI Express capability */
 
     MemoryRegion mmio_bars[6];
     SimbricksPciBarInfo bar_info[6];
@@ -105,6 +111,13 @@ typedef struct SimbricksPciState {
 
     struct SimbricksPciState *next_simbricks;
 } SimbricksPciState;
+
+typedef struct SimbricksPciClass {
+    PCIDeviceClass parent_class;
+    /* Chained to set cap_present after properties are applied, but before
+     * pci_qdev_realize() sizes the config space (as virtio-pci does). */
+    DeviceRealize parent_dc_realize;
+} SimbricksPciClass;
 
 static SimbricksPciState *simbricks_all = NULL;
 void simbricks_cleanup(void);
@@ -811,7 +824,6 @@ static void pci_simbricks_realize(PCIDevice *pdev, Error **errp)
     }
 
     if (simbricks->dev_intro.pci_msix_nvecs > 0) {
-        /* TODO: MSI-X cap offset is hardcoded */
         if (msix_init(pdev, simbricks->dev_intro.pci_msix_nvecs,
                 &simbricks->mmio_bars[simbricks->dev_intro.pci_msix_table_bar],
                 simbricks->dev_intro.pci_msix_table_bar,
@@ -826,6 +838,20 @@ static void pci_simbricks_realize(PCIDevice *pdev, Error **errp)
 
         for (i = 0; i < simbricks->dev_intro.pci_msix_nvecs; i++) {
             msix_vector_use(pdev, i);
+        }
+    }
+
+    if (pci_is_express(pdev)) {
+        /* Initialized last, with offset 0, so QEMU places it clear of the
+         * MSI/MSI-X capabilities above -- the MSI-X offset comes from the
+         * device intro and is typically hardcoded by the simulator.
+         *
+         * Synthesized by QEMU: link speed/width come from the PCIESlot
+         * defaults, not from the device at the far end -- the SimBricks PCIe
+         * intro cannot carry capabilities. */
+        if (pcie_endpoint_cap_init(pdev, 0) < 0) {
+            error_setg(errp, "failed to initialize PCIe capability");
+            return;
         }
     }
 
@@ -874,14 +900,35 @@ static const Property simbricks_pci_dev_properties[] = {
       SIMBRICKS_PROTO_SYNC_SIMBRICKS),
   DEFINE_PROP_UINT64("pci-latency", SimbricksPciState, pci_latency, 500),
   DEFINE_PROP_UINT64("sync-period", SimbricksPciState, sync_period, 500),
+  /* Present as a PCI Express endpoint instead of a conventional PCI device.
+   * Off by default, as it changes what the guest sees on the bus. */
+  DEFINE_PROP_BOOL("pcie", SimbricksPciState, pcie, false),
 };
+
+static void simbricks_pci_dc_realize(DeviceState *qdev, Error **errp)
+{
+    SimbricksPciClass *sklass = SIMBRICKS_PCI_GET_CLASS(qdev);
+    SimbricksPciState *simbricks = SIMBRICKS_PCI(qdev);
+
+    /* pci_qdev_realize() sets QEMU_PCI_CAP_EXPRESS itself only for classes
+     * that are exclusively INTERFACE_PCIE_DEVICE. We declare both interfaces,
+     * so the flag is ours to set, before the parent sizes the config space. */
+    if (simbricks->pcie) {
+        PCI_DEVICE(qdev)->cap_present |= QEMU_PCI_CAP_EXPRESS;
+    }
+
+    sklass->parent_dc_realize(qdev, errp);
+}
 
 static void simbricks_pci_class_init(ObjectClass *class, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(class);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(class);
+    SimbricksPciClass *sklass = SIMBRICKS_PCI_CLASS(class);
 
     device_class_set_props(dc, simbricks_pci_dev_properties);
+    device_class_set_parent_realize(dc, simbricks_pci_dc_realize,
+                                    &sklass->parent_dc_realize);
 
     k->realize = pci_simbricks_realize;
     k->exit = pci_simbricks_uninit;
@@ -900,13 +947,16 @@ static void simbricks_pci_class_init(ObjectClass *class, const void *data)
 static void pci_simbricks_register_types(void)
 {
     static InterfaceInfo interfaces[] = {
+        /* Both, so the device can sit on either kind of bus. */
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { INTERFACE_PCIE_DEVICE },
         { },
     };
     static const TypeInfo simbricks_info = {
         .name          = TYPE_PCI_SIMBRICKS_DEVICE,
         .parent        = TYPE_PCI_DEVICE,
         .instance_size = sizeof(SimbricksPciState),
+        .class_size    = sizeof(SimbricksPciClass),
         .instance_init = simbricks_pci_instance_init,
         .class_init    = simbricks_pci_class_init,
         .interfaces = interfaces,
