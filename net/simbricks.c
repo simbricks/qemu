@@ -261,9 +261,6 @@ int net_init_simbricks(const Netdev *netdev, const char *name,
 
     simbricks->sync = simbricks->netif.base.sync;
 
-    simbricks->netif.base.params.sync_interval *= 1000ULL;
-    simbricks->netif.base.params.link_latency *= 1000ULL;
-
     if (simbricks->sync)
     {
         /* send a first sync */

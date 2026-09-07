@@ -654,8 +654,8 @@ static int simbricks_connect(SimbricksPciState *simbricks, Error **errp)
     }
 
     SimbricksPcieIfDefaultParams(&params);
-    params.link_latency = simbricks->pci_latency * 1000;
-    params.sync_interval = simbricks->sync_period * 1000;
+    params.link_latency = simbricks->pci_latency;
+    params.sync_interval = simbricks->sync_period;
     params.blocking_conn = true;
     params.sock_path = simbricks->socket_path;
     params.sync_mode = (simbricks->sync ? kSimbricksBaseIfSyncRequired :
@@ -898,8 +898,8 @@ static const Property simbricks_pci_dev_properties[] = {
   DEFINE_PROP_BOOL("sync", SimbricksPciState, sync, false),
   DEFINE_PROP_INT32("sync-mode", SimbricksPciState, sync_mode,
       SIMBRICKS_PROTO_SYNC_SIMBRICKS),
-  DEFINE_PROP_UINT64("pci-latency", SimbricksPciState, pci_latency, 500),
-  DEFINE_PROP_UINT64("sync-period", SimbricksPciState, sync_period, 500),
+  DEFINE_PROP_UINT64("pci-latency", SimbricksPciState, pci_latency, 500000),
+  DEFINE_PROP_UINT64("sync-period", SimbricksPciState, sync_period, 500000),
   /* Present as a PCI Express endpoint instead of a conventional PCI device.
    * Off by default, as it changes what the guest sees on the bus. */
   DEFINE_PROP_BOOL("pcie", SimbricksPciState, pcie, false),
